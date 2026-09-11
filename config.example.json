@@ -1,0 +1,19 @@
+{
+  "browser": "chrome",
+  "user_data_dir": null,
+  "profiles": ["*"],
+
+  "output_dir": null,
+  "output_format": "csv",
+  "encoding": "utf-8-sig",
+
+  "interval_minutes": 60,
+  "initial_lookback_hours": 24,
+  "skip_empty": true,
+
+  "state_file": null,
+  "log_file": null,
+  "log_level": "INFO",
+  "log_max_bytes": 1000000,
+  "log_backup_count": 3
+}
