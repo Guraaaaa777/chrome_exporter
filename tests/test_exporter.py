@@ -7,7 +7,10 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 from xml.etree import ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -221,6 +224,25 @@ class ExportFlowTest(unittest.TestCase):
             conn.close()
         self.assertEqual(len(records), 2)
 
+    def test_run_once_waits_for_other_export(self):
+        cfg = self.config()
+        other = ProcessLock(service.export_lock_path(cfg))
+        other.acquire()
+        # 別プロセスがエクスポート中は、タイムアウトまで待って諦める（状態は進めない）
+        with mock.patch.object(service, "_EXPORT_LOCK_TIMEOUT_SECONDS", 0.2):
+            try:
+                with self.assertRaises(AlreadyRunning):
+                    service.run_once(cfg, now=self.now)
+            finally:
+                other.release()
+        self.assertIsNone(State(cfg.state_path).last_export_end)
+
+        # 待っている間に解放されれば、その後に実行される
+        other.acquire()
+        threading.Timer(0.3, other.release).start()
+        result = service.run_once(cfg, now=self.now)
+        self.assertEqual(result.record_count, 3)
+
     def test_missing_user_data_dir(self):
         cfg = self.config(user_data_dir=str(self.root / "nope"))
         with self.assertRaises(ConfigError):
@@ -320,6 +342,19 @@ class ProcessLockTest(unittest.TestCase):
             # 解放後は取り直せる
             with ProcessLock(path):
                 pass
+
+    def test_acquire_with_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "export.lock"
+            first = ProcessLock(path)
+            first.acquire()
+            try:
+                started = time.monotonic()
+                with self.assertRaises(AlreadyRunning):
+                    ProcessLock(path).acquire(timeout=0.3)
+                self.assertGreaterEqual(time.monotonic() - started, 0.3)
+            finally:
+                first.release()
 
 
 if __name__ == "__main__":

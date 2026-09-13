@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import chrome, exporter
 from .config import Config
+from .lockfile import AlreadyRunning, ProcessLock
 from .state import State
 from .timeutil import floor_to_minute, now_local
 
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 # 停止フラグを確認する間隔（秒）
 _POLL_SECONDS = 5
+# 別プロセスのエクスポート完了を待つ最大秒数
+_EXPORT_LOCK_TIMEOUT_SECONDS = 60
 
 
 @dataclass
@@ -33,10 +36,31 @@ def stop_flag_path(config: Config) -> Path:
     return config.state_path.with_name("stop.flag")
 
 
+def export_lock_path(config: Config) -> Path:
+    return config.state_path.with_name("export.lock")
+
+
 def run_once(config: Config, now: datetime | None = None, force: bool = False) -> ExportResult:
-    """前回の続きから現在までの履歴を 1 ファイルに書き出す。"""
+    """前回の続きから現在までの履歴を 1 ファイルに書き出す。
+
+    状態ファイルの読み込みから更新までを export.lock で排他するので、常駐プロセスと
+    once が同時に動いても期間が競合しない（後から来た方は先の完了を待つ）。
+    """
     config.validate()
     user_data_dir = config.resolve_user_data_dir()
+    lock = ProcessLock(export_lock_path(config))
+    try:
+        lock.acquire(timeout=_EXPORT_LOCK_TIMEOUT_SECONDS)
+    except AlreadyRunning as exc:
+        raise AlreadyRunning(f"別のプロセスがエクスポート中のため実行できませんでした（ロック: {lock.path}）") from exc
+    try:
+        return _export(config, user_data_dir, now, force)
+    finally:
+        lock.release()
+
+
+def _export(config: Config, user_data_dir: Path, now: datetime | None, force: bool) -> ExportResult:
+    # 状態の読み込みと期間の決定はロック取得後に行う（待っている間に進んでいる可能性がある）
     state = State(config.state_path)
 
     end = floor_to_minute(now or now_local())
@@ -84,6 +108,8 @@ def run_forever(config: Config, stop_event: threading.Event | None = None) -> No
             result = run_once(config)
             if result.skipped_reason:
                 logger.info("スキップ: %s", result.skipped_reason)
+        except AlreadyRunning as exc:
+            logger.warning("%s。次回の実行で再試行します", exc)
         except Exception:  # 1 回の失敗で常駐を止めない
             logger.exception("エクスポートに失敗しました。次回の実行で再試行します")
 

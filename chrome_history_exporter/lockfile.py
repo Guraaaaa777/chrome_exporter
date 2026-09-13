@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from types import TracebackType
+
+# ロック待ちの再試行間隔（秒）
+_RETRY_SECONDS = 0.1
 
 
 class AlreadyRunning(Exception):
@@ -22,7 +26,19 @@ class ProcessLock:
         self.path = path
         self._fp = None
 
-    def acquire(self) -> None:
+    def acquire(self, timeout: float = 0) -> None:
+        """ロックを取得する。取れなければ timeout 秒まで待ち、それでも駄目なら AlreadyRunning。"""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self._try_acquire()
+                return
+            except AlreadyRunning:
+                if time.monotonic() >= deadline:
+                    raise
+            time.sleep(_RETRY_SECONDS)
+
+    def _try_acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fp = self.path.open("a+")
         try:

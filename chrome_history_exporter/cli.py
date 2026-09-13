@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("中断しました", file=sys.stderr)
         return 130
-    except (ConfigError, chrome.HistoryReadError, windows_task.TaskError) as exc:
+    except (ConfigError, chrome.HistoryReadError, windows_task.TaskError, AlreadyRunning) as exc:
         logger.error("%s", exc)
         print(f"エラー: {exc}", file=sys.stderr)
         return 1
