@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import sqlite3
@@ -113,6 +114,23 @@ def list_profiles(user_data_dir: Path, wanted: list[str] | None = None) -> list[
             continue
         selected.extend((n, p) for n, p in all_profiles if n == name)
     return selected
+
+
+def profile_display_names(user_data_dir: Path) -> dict[str, str]:
+    """Local State から {プロファイルのフォルダ名: Chrome 上の表示名} を読む。読めなければ空。"""
+    try:
+        data = json.loads((user_data_dir / "Local State").read_text(encoding="utf-8-sig"))
+        cache = data["profile"]["info_cache"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.debug("プロファイルの表示名を読めません: %s", exc)
+        return {}
+    if not isinstance(cache, dict):
+        return {}
+    return {
+        folder: info["name"]
+        for folder, info in cache.items()
+        if isinstance(info, dict) and isinstance(info.get("name"), str)
+    }
 
 
 def _copy_history(history_path: Path, dest_dir: Path) -> Path:

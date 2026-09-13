@@ -4,20 +4,20 @@ from __future__ import annotations
 
 import csv
 import json
+import queue
 import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
-from xml.etree import ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chrome_history_exporter import chrome, exporter, service, windows_task  # noqa: E402
+from chrome_history_exporter import autostart, chrome, exporter, service  # noqa: E402
 from chrome_history_exporter.config import Config, ConfigError, load_config  # noqa: E402
 from chrome_history_exporter.lockfile import AlreadyRunning, ProcessLock  # noqa: E402
 from chrome_history_exporter.state import State  # noqa: E402
@@ -50,6 +50,19 @@ def make_history_db(path: Path, visits: list[tuple[str, str, datetime, int]]) ->
         )
     conn.commit()
     conn.close()
+
+
+def temp_config(root: Path, **overrides) -> Config:
+    params = {
+        "user_data_dir": str(root / "User Data"),
+        "output_dir": str(root / "out"),
+        "state_file": str(root / "state.json"),
+        "log_file": str(root / "log.txt"),
+        "initial_lookback_hours": 1,
+        "encoding": "utf-8",
+    }
+    params.update(overrides)
+    return Config(**params)
 
 
 class TimeUtilTest(unittest.TestCase):
@@ -121,22 +134,21 @@ class ExportFlowTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def config(self, **overrides) -> Config:
-        params = {
-            "user_data_dir": str(self.user_data),
-            "output_dir": str(self.output),
-            "state_file": str(self.root / "state.json"),
-            "log_file": str(self.root / "log.txt"),
-            "initial_lookback_hours": 1,
-            "encoding": "utf-8",
-        }
-        params.update(overrides)
-        return Config(**params)
+        return temp_config(self.root, **overrides)
 
     def test_list_profiles(self):
         names = [name for name, _ in chrome.list_profiles(self.user_data, None)]
         self.assertEqual(names, ["Default", "Profile 1"])
         names = [name for name, _ in chrome.list_profiles(self.user_data, ["Profile 1"])]
         self.assertEqual(names, ["Profile 1"])
+
+    def test_profile_display_names(self):
+        self.assertEqual(chrome.profile_display_names(self.user_data), {})  # Local State なし
+        local_state = {"profile": {"info_cache": {"Default": {"name": "個人"}, "Profile 1": {"name": "仕事"}}}}
+        (self.user_data / "Local State").write_text(json.dumps(local_state), encoding="utf-8")
+        self.assertEqual(
+            chrome.profile_display_names(self.user_data), {"Default": "個人", "Profile 1": "仕事"}
+        )
 
     def test_run_once_writes_expected_file(self):
         result = service.run_once(self.config(), now=self.now)
@@ -249,6 +261,83 @@ class ExportFlowTest(unittest.TestCase):
             service.run_once(cfg, now=self.now)
 
 
+class SchedulerTest(unittest.TestCase):
+    """実際の現在時刻で動かし、画面へ届く通知と次回時刻を確かめる。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.scheduler: service.Scheduler | None = None
+
+    def tearDown(self):
+        if self.scheduler is not None:
+            self.scheduler.shutdown(wait=5)
+        self._tmp.cleanup()
+
+    def start_scheduler(self, cfg: Config) -> service.Scheduler:
+        self.scheduler = service.Scheduler(lambda: cfg, lambda kind, payload: self.events.put((kind, payload)))
+        return self.scheduler
+
+    def wait_for(self, kind: str, timeout: float = 10) -> object:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                got, payload = self.events.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if got == kind:
+                return payload
+        self.fail(f"{kind} が届きませんでした")
+
+    def wait_until(self, condition, timeout: float = 10) -> None:
+        deadline = time.monotonic() + timeout
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail("条件を満たしませんでした")
+            time.sleep(0.02)
+
+    def test_run_now_then_auto(self):
+        now = datetime.now().astimezone()
+        make_history_db(
+            self.root / "User Data" / "Default" / "History",
+            [("https://example.com/now", "いま", now - timedelta(minutes=5), 0)],
+        )
+        scheduler = self.start_scheduler(temp_config(self.root, interval_minutes=30))
+
+        scheduler.run_now()
+        result = self.wait_for(service.DONE)
+        self.assertEqual(result.record_count, 1)
+        self.assertIsNotNone(result.file_path)
+        self.assertFalse(scheduler.enabled)
+        self.assertIsNone(scheduler.next_run)
+
+        scheduler.start()  # 開始するとすぐ前回の続きを書き出す
+        self.wait_for(service.BUSY)
+        self.wait_for(service.DONE)
+        self.wait_until(lambda: not scheduler.busy)
+        remaining = (scheduler.next_run - datetime.now().astimezone()).total_seconds()
+        self.assertAlmostEqual(remaining, 30 * 60, delta=10)
+
+        scheduler.stop()
+        self.assertFalse(scheduler.enabled)
+        self.assertIsNone(scheduler.next_run)
+
+    def test_failure_is_reported_and_thread_survives(self):
+        scheduler = self.start_scheduler(temp_config(self.root, user_data_dir=str(self.root / "nope")))
+        scheduler.run_now()
+        message = self.wait_for(service.FAILED)
+        self.assertIn("見つかりません", message)
+        self.assertTrue(scheduler.alive)
+
+    def test_shutdown_stops_thread(self):
+        scheduler = self.start_scheduler(temp_config(self.root))
+        scheduler.start()
+        scheduler.shutdown(wait=5)
+        self.assertFalse(scheduler.alive)
+        self.assertFalse(scheduler.enabled)
+
+
 class ConfigTest(unittest.TestCase):
     def test_load_and_validate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -257,75 +346,63 @@ class ConfigTest(unittest.TestCase):
             cfg = load_config(path)
             self.assertEqual(cfg.interval_minutes, 15)
             self.assertEqual(cfg.output_format, "jsonl")
+            self.assertEqual(cfg.config_path, path)
 
-            path.write_text(json.dumps({"output_format": "xml"}), encoding="utf-8")
-            with self.assertRaises(ConfigError):
-                load_config(path)
-
-            path.write_text(json.dumps({"unknown_key": 1}), encoding="utf-8")
-            with self.assertRaises(ConfigError):
-                load_config(path)
+            for broken in ({"output_format": "xml"}, {"interval_minutes": 0},
+                           {"interval_minutes": "60"}, {"profiles": []}, {"encoding": "nope"}):
+                path.write_text(json.dumps(broken), encoding="utf-8")
+                with self.assertRaises(ConfigError, msg=broken):
+                    load_config(path)
 
             path.write_text("{ broken", encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_config(path)
 
-    def test_missing_explicit_config(self):
-        with self.assertRaises(ConfigError):
-            load_config(Path("/nonexistent/config.json"))
+    def test_legacy_cli_config_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            legacy = {
+                "browser": "chrome", "user_data_dir": None, "profiles": ["*"], "output_dir": None,
+                "output_format": "csv", "encoding": "utf-8-sig", "interval_minutes": 60,
+                "initial_lookback_hours": 24, "skip_empty": True, "state_file": None,
+                "log_file": None, "log_level": "INFO", "log_max_bytes": 1000000, "log_backup_count": 3,
+                "someday_key": 1,
+            }
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            with self.assertLogs("chrome_history_exporter.config", "WARNING"):
+                cfg = load_config(path)
+            self.assertEqual(cfg.interval_minutes, 60)
+            self.assertTrue(cfg.auto_export_on_launch)
+            self.assertTrue(cfg.close_to_tray)
+
+    def test_save_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sub" / "config.json"
+            cfg = Config(profiles=["Default"], interval_minutes=30, close_to_tray=False, config_path=path)
+            cfg.save()
+            loaded = load_config(path)
+            self.assertEqual(loaded, cfg)
+            self.assertFalse((path.with_name("config.json.tmp")).exists())
+
+    def test_missing_config_gives_defaults(self):
+        path = Path(tempfile.gettempdir()) / "nonexistent-dir-for-test" / "config.json"
+        cfg = load_config(path)
+        self.assertEqual(cfg, Config())
+        self.assertEqual(cfg.config_path, path)
 
 
-class WindowsTaskTest(unittest.TestCase):
-    """XML の生成はプラットフォームに依存しないのでどこでも検証できる。"""
+class AutostartTest(unittest.TestCase):
+    """レジストリには触らず、登録するコマンドだけ確かめる。"""
 
-    def _parse(self, xml: str) -> ET.Element:
-        return ET.fromstring(xml)
+    def test_command_for_script(self):
+        command = autostart.launch_command()
+        self.assertIn("run.py", command)
+        self.assertTrue(command.endswith(" --minimized"))
 
-    def test_resident_xml(self):
-        xml = windows_task.build_task_xml("resident")
-        root = self._parse(xml)
-        ns = {"t": windows_task.TASK_NS}
-        self.assertIsNotNone(root.find("t:Triggers/t:LogonTrigger", ns))
-        self.assertEqual(root.findtext("t:Settings/t:ExecutionTimeLimit", namespaces=ns), "PT0S")
-        self.assertIsNotNone(root.find("t:Settings/t:RestartOnFailure", ns))
-        arguments = root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns)
-        self.assertTrue(arguments.endswith(" run"))
-        self.assertIn("run.py", arguments)
-
-    def test_interval_xml(self):
-        config = Path("C:/Users/name with space/config.json")
-        xml = windows_task.build_task_xml("interval", 15, config, start=datetime(2026, 9, 11, 12, 0))
-        root = self._parse(xml)
-        ns = {"t": windows_task.TASK_NS}
-        self.assertEqual(
-            root.findtext("t:Triggers/t:TimeTrigger/t:StartBoundary", namespaces=ns),
-            "2026-09-11T12:00:00",
-        )
-        self.assertEqual(
-            root.findtext("t:Triggers/t:TimeTrigger/t:Repetition/t:Interval", namespaces=ns),
-            "PT15M",
-        )
-        arguments = root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns)
-        self.assertIn(" once ", arguments + " ")
-        # 空白を含むパスが引用符で囲まれていること
-        self.assertIn('"', arguments)
-        self.assertIn("name with space", arguments)
-
-    def test_task_name_in_uri(self):
-        xml = windows_task.build_task_xml("resident", task_name="My & Task")
-        root = self._parse(xml)
-        self.assertEqual(
-            root.findtext("{%s}RegistrationInfo/{%s}URI" % (windows_task.TASK_NS, windows_task.TASK_NS)),
-            "\\My & Task",
-        )
-
-    def test_invalid_arguments(self):
-        with self.assertRaises(windows_task.TaskError):
-            windows_task.build_task_xml("weird-mode")
-        with self.assertRaises(windows_task.TaskError):
-            windows_task.build_task_xml("interval", 0)
-        with self.assertRaises(windows_task.TaskError):
-            windows_task.build_task_xml("interval", 100_000)
+    def test_command_for_exe(self):
+        exe = r"C:\Apps\Chrome History\ChromeHistoryExporter.exe"
+        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(sys, "executable", exe):
+            self.assertEqual(autostart.launch_command(), f'"{exe}" --minimized')
 
 
 class ProcessLockTest(unittest.TestCase):
@@ -355,6 +432,44 @@ class ProcessLockTest(unittest.TestCase):
                 self.assertGreaterEqual(time.monotonic() - started, 0.3)
             finally:
                 first.release()
+
+
+class GuiSmokeTest(unittest.TestCase):
+    """画面を組み立てて、フォームの読み書きが設定と一致することを確かめる。"""
+
+    def test_build_and_read_form(self):
+        try:
+            import tkinter
+
+            tkinter.Tk().destroy()
+            from chrome_history_exporter.gui import App
+        except Exception as exc:  # 画面の無い環境では飛ばす
+            self.skipTest(f"tkinter を使えません: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_history_db(root / "User Data" / "Default" / "History", [])
+            local_state = {"profile": {"info_cache": {"Default": {"name": "テスト"}}}}
+            (root / "User Data" / "Local State").write_text(json.dumps(local_state), encoding="utf-8")
+            (root / "out").mkdir()
+            (root / "out" / "202609111200-202609111300.csv").write_text("x", encoding="utf-8")
+            (root / "out" / "memo.txt").write_text("x", encoding="utf-8")
+
+            cfg = temp_config(root, profiles=["Default"], interval_minutes=30, auto_export_on_launch=False)
+            cfg.config_path = root / "config.json"
+            app = App(cfg, tray=False)
+            try:
+                app.root.update()
+                self.assertEqual(app._read_form(), cfg)
+                self.assertIn("Default", app.profile_vars)
+                self.assertEqual(len(app.files_tree.get_children()), 1)  # 出力ファイル以外は出さない
+
+                app.interval_var.set("abc")
+                with self.assertRaises(ConfigError):
+                    app._read_form()
+            finally:
+                app.scheduler.shutdown(wait=5)
+                app._finish_quit()
 
 
 if __name__ == "__main__":

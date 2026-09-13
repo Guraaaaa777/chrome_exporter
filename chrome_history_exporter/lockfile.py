@@ -1,7 +1,8 @@
-"""多重起動を防ぐためのプロセスロック（Windows / POSIX 両対応）。"""
+"""同じ状態ファイルを複数のプロセスで同時に更新しないためのファイルロック。"""
 
 from __future__ import annotations
 
+import msvcrt
 import os
 import time
 from pathlib import Path
@@ -16,10 +17,10 @@ class AlreadyRunning(Exception):
 
 
 class ProcessLock:
-    """OS のファイルロックを使った単一インスタンス制御。
+    """Windows のファイルロック（msvcrt.locking）を使った排他制御。
 
     ロックはプロセス終了時（強制終了を含む）に OS が自動解放するため、
-    残骸ファイルで起動不能になることがない。
+    残骸ファイルで動かなくなることがない。
     """
 
     def __init__(self, path: Path):
@@ -42,15 +43,8 @@ class ProcessLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fp = self.path.open("a+")
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                self._fp.seek(0)
-                msvcrt.locking(self._fp.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._fp.seek(0)
+            msvcrt.locking(self._fp.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError as exc:
             self._fp.close()
             self._fp = None
@@ -65,15 +59,8 @@ class ProcessLock:
         if self._fp is None:
             return
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                self._fp.seek(0)
-                msvcrt.locking(self._fp.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
+            self._fp.seek(0)
+            msvcrt.locking(self._fp.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             pass
         finally:
